@@ -275,8 +275,6 @@ class MusicAutoregressiveWrapper(nn.Module):
         min_p_ratio=0.02,
         monotonicity_dim=None,
         return_attn=False,
-        streaming=False,  # New argument for streaming mode
-        chunk_size=10,  # New argument for chunk size
         **kwargs,
     ):
         _, t, dim = start_tokens.shape
@@ -340,10 +338,6 @@ class MusicAutoregressiveWrapper(nn.Module):
 
         instrument_dim = self.dimensions["instrument"]
         type_dim = self.dimensions["type"]
-
-        # Initialize a list to store the generated sequence
-        generated_sequence = []
-
         for _ in range(seq_len):
             x = out[:, -self.max_seq_len :]
             mask = mask[:, -self.max_seq_len :]
@@ -450,14 +444,6 @@ class MusicAutoregressiveWrapper(nn.Module):
             out = torch.cat((out, stacked), dim=1)
             mask = F.pad(mask, (0, 1), value=True)
 
-            # Add the generated tokens to the sequence
-            generated_sequence.append(stacked)
-
-            # Yield chunks of data if streaming is enabled
-            if streaming and len(generated_sequence) >= chunk_size:
-                yield torch.cat(generated_sequence, dim=1)
-                generated_sequence = []
-
             if exists(eos_token):
                 is_eos_tokens = out[..., 0] == eos_token
 
@@ -468,21 +454,17 @@ class MusicAutoregressiveWrapper(nn.Module):
                         out[i, idx + 1 :] = self.pad_value
                     break
 
-         # Yield any remaining data if streaming is enabled
-        if streaming and generated_sequence:
-            yield torch.cat(generated_sequence, dim=1)
-        else:
-            out = out[:, t:]
+        out = out[:, t:]
 
-            if num_dims == 1:
-                out = out.squeeze(0)
+        if num_dims == 1:
+            out = out.squeeze(0)
 
-            self.net.train(was_training)
+        self.net.train(was_training)
 
-            if return_attn:
-                return out, attn
+        if return_attn:
+            return out, attn
 
-            return out
+        return out
 
     def forward(self, x, return_list=False, **kwargs):
         xi = x[:, :-1]
@@ -595,4 +577,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

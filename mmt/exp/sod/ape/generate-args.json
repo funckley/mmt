@@ -1,0 +1,1 @@
+{"dataset": "sod", "names": "data/sod/processed/test-names.txt", "in_dir": "../data/sod/processed/notes", "out_dir": "/Users/funckley/Documents/GitHub/mmt/mmt/exp/sod/ape", "n_samples": 1, "shuffle": false, "use_csv": false, "model_steps": null, "seq_len": 128, "temperature": 1.0, "filter": "top_k", "filter_threshold": 0.9, "gpu": -1, "jobs": 1, "quiet": false, "streaming": true}

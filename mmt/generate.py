@@ -15,6 +15,9 @@ import dataset
 import music_x_transformers
 import representation
 import utils
+import time
+
+debug = True  # Set to True for debugging mode
 
 
 @utils.resolve_paths
@@ -91,6 +94,11 @@ def parse_args(args=None, namespace=None):
     )
     parser.add_argument(
         "-q", "--quiet", action="store_true", help="show warnings only"
+    )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="enable streaming mode for generating MIDI data in chunks",
     )
     return parser.parse_args(args=args, namespace=namespace)
 
@@ -177,12 +185,15 @@ def main():
     if args.dataset is not None:
         if args.names is None:
             args.names = pathlib.Path(
-                f"data/{args.dataset}/processed/test-names.txt"
+                f"../data/{args.dataset}/processed/test-names.txt"
             )
         if args.in_dir is None:
-            args.in_dir = pathlib.Path(f"data/{args.dataset}/processed/notes/")
+            args.in_dir = pathlib.Path(f"../data/{args.dataset}/processed/notes/")
         if args.out_dir is None:
-            args.out_dir = pathlib.Path(f"exp/test_{args.dataset}")
+            args.out_dir = pathlib.Path(f"../exp/test_{args.dataset}")
+
+    # Ensure the output directory exists
+    args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # Set up the logger
     logging.basicConfig(
@@ -227,9 +238,7 @@ def main():
     (sample_dir / "mp3-trimmed").mkdir(exist_ok=True)
 
     # Get the specified device
-    device = torch.device(
-        f"cuda:{args.gpu}" if args.gpu is not None else "cpu"
-    )
+    device = torch.device("cuda" if args.gpu >= 0 else "cpu")
     logging.info(f"Using device: {device}")
 
     # Load the encoding
@@ -245,6 +254,8 @@ def main():
         max_beat=train_args["max_beat"],
         use_csv=args.use_csv,
     )
+    if debug:
+        print(f"Dataset loaded successfully. Number of samples: {len(test_dataset)}")
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
         shuffle=args.shuffle,
@@ -254,19 +265,34 @@ def main():
 
     # Create the model
     logging.info(f"Creating the model...")
+    # model = music_x_transformers.MusicXTransformer(
+    #     dim=train_args["dim"],
+    #     encoding=encoding,
+    #     depth=train_args["layers"],
+    #     heads=train_args["heads"],
+    #     max_seq_len=train_args["max_seq_len"],
+    #     max_beat=train_args["max_beat"],
+    #     rotary_pos_emb=train_args["rel_pos_emb"],
+    #     use_abs_pos_emb=train_args["abs_pos_emb"],
+    #     emb_dropout=train_args["dropout"],
+    #     attn_dropout=train_args["dropout"],
+    #     ff_dropout=train_args["dropout"],
+    # ).to(device)
+
     model = music_x_transformers.MusicXTransformer(
-        dim=train_args["dim"],
+        dim=512,  # Match the checkpoint's embedding size
         encoding=encoding,
-        depth=train_args["layers"],
-        heads=train_args["heads"],
-        max_seq_len=train_args["max_seq_len"],
-        max_beat=train_args["max_beat"],
-        rotary_pos_emb=train_args["rel_pos_emb"],
-        use_abs_pos_emb=train_args["abs_pos_emb"],
-        emb_dropout=train_args["dropout"],
-        attn_dropout=train_args["dropout"],
-        ff_dropout=train_args["dropout"],
-    ).to(device)
+        depth=6,  # Match the checkpoint's depth
+        heads=8,  # Match the checkpoint's number of attention heads
+        max_seq_len=1024,
+        max_beat=256,
+        rotary_pos_emb=False,
+        use_abs_pos_emb=True,
+        emb_dropout=0.1,
+        attn_dropout=0.1,
+        ff_dropout=0.1,
+    )
+    print("Model created successfully.")  # Debug print
 
     # Load the checkpoint
     checkpoint_dir = args.out_dir / "checkpoints"
@@ -274,7 +300,16 @@ def main():
         checkpoint_filename = checkpoint_dir / "best_model.pt"
     else:
         checkpoint_filename = checkpoint_dir / f"model_{args.model_steps}.pt"
-    model.load_state_dict(torch.load(checkpoint_filename, map_location=device))
+    if debug:
+        print(f"Loading model checkpoint from: {checkpoint_filename}")  # Debug print
+    checkpoint = torch.load(checkpoint_filename, map_location=torch.device("cpu"))
+    missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=False)
+    if debug:
+        print(f"Missing keys: {missing_keys}")
+        print(f"Unexpected keys: {unexpected_keys}")   
+    # model.load_state_dict(torch.load(checkpoint_filename, map_location=device))
+    if debug:
+        print("Model checkpoint loaded successfully.")  # Debug print
     logging.info(f"Loaded the model weights from: {checkpoint_filename}")
     model.eval()
 
@@ -305,22 +340,83 @@ def main():
             tgt_start = torch.zeros((1, 1, 6), dtype=torch.long, device=device)
             tgt_start[:, 0, 0] = sos
 
-            # Generate new samples
-            generated = model.generate(
-                tgt_start,
-                args.seq_len,
-                eos_token=eos,
-                temperature=args.temperature,
-                filter_logits_fn=args.filter,
-                filter_thres=args.filter_threshold,
-                monotonicity_dim=("type", "beat"),
-            )
-            generated_np = torch.cat((tgt_start, generated), 1).cpu().numpy()
+            # if args.streaming:
+            #     # Streaming mode: generate and save chunks of MIDI data
+            #     for chunk in model.generate(
+            #         tgt_start,
+            #         args.seq_len,
+            #         eos_token=eos,
+            #         temperature=args.temperature,
+            #         filter_logits_fn=args.filter,
+            #         filter_thres=args.filter_threshold,
+            #         monotonicity_dim=("type", "beat"),
+            #         streaming=True,
+            #         chunk_size=10,  # Adjust chunk size as needed
+            #     ):
+            #         # Process and save each chunk
+            #         chunk_np = torch.cat((tgt_start, chunk), 1).cpu().numpy()
+            #         save_result(
+            #             f"{i}_unconditioned_chunk", chunk_np[0], sample_dir, encoding
+            #         )
+            # else:
+            #     # Generate new samples
+            #     generated = model.generate(
+            #         tgt_start,
+            #         args.seq_len,
+            #         eos_token=eos,
+            #         temperature=args.temperature,
+            #         filter_logits_fn=args.filter,
+            #         filter_thres=args.filter_threshold,
+            #         monotonicity_dim=("type", "beat"),
+            #     )
+            #     generated_np = torch.cat((tgt_start, generated), 1).cpu().numpy()
 
-            # Save the results
-            save_result(
-                f"{i}_unconditioned", generated_np[0], sample_dir, encoding
-            )
+            #     # Save the results
+            #     save_result(
+            #         f"{i}_unconditioned", generated_np[0], sample_dir, encoding
+            #     )
+            
+            if args.streaming:
+                print("Streaming mode activated.")
+                # Streaming mode: generate and save chunks of MIDI data
+                total_tokens = 0  # To keep track of the total number of tokens generated
+                start_time = time.time()  # Start timing the generation process
+                if debug:
+                    print("Starting token generation...")
+
+                for chunk_idx, chunk in enumerate(model.generate(
+                    tgt_start,
+                    args.seq_len,
+                    eos_token=eos,
+                    temperature=args.temperature,
+                    filter_logits_fn=args.filter,
+                    filter_thres=args.filter_threshold,
+                    monotonicity_dim=("type", "beat"),
+                    streaming=True,
+                    chunk_size=10,  # Adjust chunk size as needed
+                )):
+                    # Measure the time taken for each chunk
+                    chunk_time = time.time() - start_time
+                    print(f"Chunk {chunk_idx + 1} generated in {chunk_time:.4f} seconds")
+
+                    # Print the size of the chunk and the tokens
+                    print(f"Chunk {chunk_idx + 1} size: {len(chunk)} tokens")
+                    print(f"Chunk {chunk_idx + 1} tokens: {chunk}")
+
+                    # Update the total number of tokens
+                    total_tokens += len(chunk)
+
+                    # Reset the start time for the next chunk
+                    start_time = time.time()
+
+                    # Process and save each chunk
+                    chunk_np = torch.cat((tgt_start, chunk), 1).cpu().numpy()
+                    save_result(
+                        f"{i}_unconditioned_chunk", chunk_np[0], sample_dir, encoding
+                    )
+
+                # Print the total number of tokens generated
+                print(f"Total tokens generated: {total_tokens}")
 
             # ------------------------------
             # Instrument-informed generation
@@ -330,25 +426,46 @@ def main():
             prefix_len = int(np.argmax(batch["seq"][0, :, 1] >= beat_0))
             tgt_start = batch["seq"][:1, :prefix_len].to(device)
 
-            # Generate new samples
-            generated = model.generate(
-                tgt_start,
-                args.seq_len,
-                eos_token=eos,
-                temperature=args.temperature,
-                filter_logits_fn=args.filter,
-                filter_thres=args.filter_threshold,
-                monotonicity_dim=("type", "beat"),
-            )
-            generated_np = torch.cat((tgt_start, generated), 1).cpu().numpy()
 
-            # Save the results
-            save_result(
-                f"{i}_instrument-informed",
-                generated_np[0],
-                sample_dir,
-                encoding,
-            )
+            if args.streaming:
+                # Streaming mode: generate and save chunks of MIDI data
+                for chunk in model.generate(
+                    tgt_start,
+                    args.seq_len,
+                    eos_token=eos,
+                    temperature=args.temperature,
+                    filter_logits_fn=args.filter,
+                    filter_thres=args.filter_threshold,
+                    monotonicity_dim=("type", "beat"),
+                    streaming=True,
+                    chunk_size=10,  # Adjust chunk size as needed
+                ):
+                    # Process and save each chunk
+                    chunk_np = torch.cat((tgt_start, chunk), 1).cpu().numpy()
+                    save_result(
+                        f"{i}_instrument-informed_chunk", chunk_np[0], sample_dir, encoding
+                    )
+
+            else:
+                # Generate new samples
+                generated = model.generate(
+                    tgt_start,
+                    args.seq_len,
+                    eos_token=eos,
+                    temperature=args.temperature,
+                    filter_logits_fn=args.filter,
+                    filter_thres=args.filter_threshold,
+                    monotonicity_dim=("type", "beat"),
+                )
+                generated_np = torch.cat((tgt_start, generated), 1).cpu().numpy()
+
+                # Save the results
+                save_result(
+                    f"{i}_instrument-informed",
+                    generated_np[0],
+                    sample_dir,
+                    encoding,
+                )
 
             # -------------------
             # 4-beat continuation
@@ -357,26 +474,46 @@ def main():
             # Get output start tokens
             cond_len = int(np.argmax(batch["seq"][0, :, 1] >= beat_4))
             tgt_start = batch["seq"][:1, :cond_len].to(device)
+            
+            if args.streaming:
+                # Streaming mode: generate and save chunks of MIDI data
+                for chunk in model.generate(
+                    tgt_start,
+                    args.seq_len,
+                    eos_token=eos,
+                    temperature=args.temperature,
+                    filter_logits_fn=args.filter,
+                    filter_thres=args.filter_threshold,
+                    monotonicity_dim=("type", "beat"),
+                    streaming=True,
+                    chunk_size=10,  # Adjust chunk size as needed
+                ):
+                    # Process and save each chunk
+                    chunk_np = torch.cat((tgt_start, chunk), 1).cpu().numpy()
+                    save_result(
+                        f"{i}_4-beat-continuation_chunk", chunk_np[0], sample_dir, encoding
+                    )
 
-            # Generate new samples
-            generated = model.generate(
-                tgt_start,
-                args.seq_len,
-                eos_token=eos,
-                temperature=args.temperature,
-                filter_logits_fn=args.filter,
-                filter_thres=args.filter_threshold,
-                monotonicity_dim=("type", "beat"),
-            )
-            generated_np = torch.cat((tgt_start, generated), 1).cpu().numpy()
+            else:
+                # Generate new samples
+                generated = model.generate(
+                    tgt_start,
+                    args.seq_len,
+                    eos_token=eos,
+                    temperature=args.temperature,
+                    filter_logits_fn=args.filter,
+                    filter_thres=args.filter_threshold,
+                    monotonicity_dim=("type", "beat"),
+                )
+                generated_np = torch.cat((tgt_start, generated), 1).cpu().numpy()
 
-            # Save the results
-            save_result(
-                f"{i}_4-beat-continuation",
-                generated_np[0],
-                sample_dir,
-                encoding,
-            )
+                # Save the results
+                save_result(
+                    f"{i}_4-beat-continuation",
+                    generated_np[0],
+                    sample_dir,
+                    encoding,
+                )
 
             # --------------------
             # 16-beat continuation
@@ -386,25 +523,44 @@ def main():
             cond_len = int(np.argmax(batch["seq"][0, :, 1] >= beat_16))
             tgt_start = batch["seq"][:1, :cond_len].to(device)
 
-            # Generate new samples
-            generated = model.generate(
-                tgt_start,
-                args.seq_len,
-                eos_token=eos,
-                temperature=args.temperature,
-                filter_logits_fn=args.filter,
-                filter_thres=args.filter_threshold,
-                monotonicity_dim=("type", "beat"),
-            )
-            generated_np = torch.cat((tgt_start, generated), 1).cpu().numpy()
+            if args.streaming:
+                # Streaming mode: generate and save chunks of MIDI data
+                for chunk in model.generate(
+                    tgt_start,
+                    args.seq_len,
+                    eos_token=eos,
+                    temperature=args.temperature,
+                    filter_logits_fn=args.filter,
+                    filter_thres=args.filter_threshold,
+                    monotonicity_dim=("type", "beat"),
+                    streaming=True,
+                    chunk_size=10,  # Adjust chunk size as needed
+                ):
+                    # Process and save each chunk
+                    chunk_np = torch.cat((tgt_start, chunk), 1).cpu().numpy()
+                    save_result(
+                        f"{i}_16-beat-continuation_chunk", chunk_np[0], sample_dir, encoding
+                    )
+            else:
+                # Generate new samples
+                generated = model.generate(
+                    tgt_start,
+                    args.seq_len,
+                    eos_token=eos,
+                    temperature=args.temperature,
+                    filter_logits_fn=args.filter,
+                    filter_thres=args.filter_threshold,
+                    monotonicity_dim=("type", "beat"),
+                )
+                generated_np = torch.cat((tgt_start, generated), 1).cpu().numpy()
 
-            # Save results
-            save_result(
-                f"{i}_16-beat-continuation",
-                generated_np[0],
-                sample_dir,
-                encoding,
-            )
+                # Save results
+                save_result(
+                    f"{i}_16-beat-continuation",
+                    generated_np[0],
+                    sample_dir,
+                    encoding,
+                )
 
 
 if __name__ == "__main__":
