@@ -1,124 +1,224 @@
-import torch
 import mido
-from mmt import generate
-from mmt import MusicXTransformer
+from pythonosc.udp_client import SimpleUDPClient
+from pythonosc.dispatcher import Dispatcher
+from pythonosc.osc_server import BlockingOSCUDPServer
+
+# Configuration
+STREAM_DEVICE_IP = "192.168.1.100"  # Replace with the IP of the device running stream.py
+STREAM_DEVICE_PORT = 5005          # Port where stream.py's OSC server is listening
+LOCAL_IP = "192.168.1.101"         # Replace with the IP of this device
+LOCAL_PORT = 5006                  # Port where this device's OSC server will listen
+
+# Instrument code map
+instrument_code_map = {
+    "piano": 1,
+    "electric-piano": 2,
+    "harpsichord": 3,
+    "clavinet": 4,
+    "celesta": 5,
+    "glockenspiel": 6,
+    "music-box": 7,
+    "vibraphone": 8,
+    "marimba": 9,
+    "xylophone": 10,
+    "tubular-bells": 11,
+    "dulcimer": 12,
+    "organ": 13,
+    "church-organ": 14,
+    "accordion": 15,
+    "harmonica": 16,
+    "bandoneon": 17,
+    "nylon-string-guitar": 18,
+    "steel-string-guitar": 19,
+    "electric-guitar": 20,
+    "bass": 21,
+    "electric-bass": 22,
+    "slap-bass": 23,
+    "synth-bass": 24,
+    "violin": 25,
+    "viola": 26,
+    "cello": 27,
+    "contrabass": 28,
+    "harp": 29,
+    "timpani": 30,
+    "strings": 31,
+    "synth-strings": 32,
+    "voices": 33,
+    "orchestra-hit": 34,
+    "trumpet": 35,
+    "trombone": 36,
+    "tuba": 37,
+    "horn": 38,
+    "brasses": 39,
+    "synth-brasses": 40,
+    "soprano-saxophone": 41,
+    "alto-saxophone": 42,
+    "tenor-saxophone": 43,
+    "baritone-saxophone": 44,
+    "oboe": 45,
+    "english-horn": 46,
+    "bassoon": 47,
+    "clarinet": 48,
+    "piccolo": 49,
+    "flute": 50,
+    "recorder": 51,
+    "pan-flute": 52,
+    "ocarina": 53,
+    "lead": 54,
+    "pad": 55,
+    "sitar": 56,
+    "banjo": 57,
+    "shamisen": 58,
+    "koto": 59,
+    "kalimba": 60,
+    "bag-pipe": 61,
+    "shehnai": 62,
+    "melodic-tom": 63,
+    "synth-drums": 64,
+    "null": 0
+}
+
+# Map MIDI notes to instruments (specific to your MIDI controller)
+midi_note_to_instrument = {
+    48: "piano",                # MIDI note 48 → piano
+    50: "clarinet",             # MIDI note 50 → clarinet
+    52: "brasses",              # MIDI note 52 → brasses
+    53: "marimba",              # MIDI note 53 → marimba
+    55: "nylon-string-guitar",  # MIDI note 55 → nylon-string-guitar
+    57: "violin",               # MIDI note 57 → violin
+    59: "cello",                # MIDI note 59 → cello
+    60: "flute"                 # MIDI note 60 → flute
+}
+
+# Special MIDI note to send the `/new_instruments` message
+SEND_MESSAGE_NOTE = 72  # C5: Send the `/new_instruments` message
+START_MESSAGE_NOTE = 71  # B4: Send the `/start` message
+
+# Instrument state (0 = off, 1 = on)
+instrument_state = {name: 0 for name in instrument_code_map.keys()}
+
+# Set up the OSC client to send messages to stream.py
+def setup_osc_client(ip, port):
+    client = SimpleUDPClient(ip, port)
+    print(f"OSC client set up to send messages to {ip}:{port}")
+    return client
+
+# Set up the OSC server to receive messages from stream.py
+def setup_osc_server(ip, port):
+    dispatcher = Dispatcher()
+
+    # Map OSC addresses to handlers
+    dispatcher.map("/tokens", handle_tokens)  # Handle generated tokens from stream.py
+
+    server = BlockingOSCUDPServer((ip, port), dispatcher)
+    print(f"OSC server listening on {ip}:{port}")
+    return server
+
+# Handler for incoming tokens
+def handle_tokens(address, *args):
+    print(f"Received tokens from {address}: {args}")
+    # Process the tokens (e.g., update buffer, apply rule-based logic)
 
 
-class MMTIntegration:
-    def __init__(self, model_path):
-        """Initialize the MMT model with the necessary parameters."""
-        self.model_path = model_path
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = self.load_model(model_path)
+# Toggle instrument state
+def toggle_instrument(osc_client, instrument_name):
+    if instrument_name not in instrument_state:
+        print(f"Instrument '{instrument_name}' not found.")
+        return
 
-    def load_model(self, model_path):
-        """Load the MMT model from the specified path."""
-        model = MusicXTransformer(
-            dim=512,  # Example dimension, adjust as needed
-            encoding={},  # Load the actual encoding
-            depth=6,  # Example depth, adjust as needed
-            heads=8,  # Example number of heads, adjust as needed
-            max_seq_len=1024,  # Example max sequence length, adjust as needed
-            max_beat=256,  # Example max beat, adjust as needed
-            rotary_pos_emb=False,
-            use_abs_pos_emb=True,
-            emb_dropout=0.1,
-            attn_dropout=0.1,
-            ff_dropout=0.1,
-        ).to(self.device)
-        checkpoint = torch.load(model_path, map_location=self.device)
-        model.load_state_dict(checkpoint)
-        model.eval()
-        return model
+    # Toggle the instrument state
+    instrument_state[instrument_name] = 1 - instrument_state[instrument_name]
+    state = instrument_state[instrument_name]
+    print(f"Toggled instrument '{instrument_name}' to state {state}.")
 
-    def generate_midi(self, control_data):
-        """Generate a complete MIDI sequence based on control data.
-        
-        Args:
-            control_data: The control data for generating the MIDI sequence.
-        
-        Returns:
-            The generated MIDI sequence.
-        """
-        start_tokens = control_data["start_tokens"]
-        seq_len = control_data["seq_len"]
-        eos_token = control_data.get("eos_token", None)
-        temperature = control_data.get("temperature", 1.0)
-        filter_logits_fn = control_data.get("filter_logits_fn", "top_k")
-        filter_thres = control_data.get("filter_thres", 0.9)
-        monotonicity_dim = control_data.get("monotonicity_dim", ("type", "beat"))
+    # Get the list of active instruments (numbers for OSC, names for printing)
+    active_instruments = [
+        instrument_code_map[name]
+        for name, is_on in instrument_state.items() if is_on == 1
+    ]
+    active_instrument_names = [
+        name for name, is_on in instrument_state.items() if is_on == 1
+    ]
 
-        generated = self.model.generate(
-            start_tokens=start_tokens,
-            seq_len=seq_len,
-            eos_token=eos_token,
-            temperature=temperature,
-            filter_logits_fn=filter_logits_fn,
-            filter_thres=filter_thres,
-            monotonicity_dim=monotonicity_dim,
-        )
-        return generated.cpu().numpy()
+    # Print the list of active instrument names
+    print(f"Active instruments: {active_instrument_names}")
 
-    def generate_midi_stream(self, control_data):
-        """Generate MIDI data in chunks and yield each chunk for real-time processing.
-        
-        Args:
-            control_data: The control data for generating the MIDI sequence.
-        
-        Yields:
-            Chunks of MIDI data.
-        """
-        start_tokens = control_data["start_tokens"]
-        seq_len = control_data["seq_len"]
-        eos_token = control_data.get("eos_token", None)
-        temperature = control_data.get("temperature", 1.0)
-        filter_logits_fn = control_data.get("filter_logits_fn", "top_k")
-        filter_thres = control_data.get("filter_thres", 0.9)
-        monotonicity_dim = control_data.get("monotonicity_dim", ("type", "beat"))
-        chunk_size = control_data.get("chunk_size", 10)
+    return active_instruments
 
-        for chunk in self.model.generate(
-            start_tokens=start_tokens,
-            seq_len=seq_len,
-            eos_token=eos_token,
-            temperature=temperature,
-            filter_logits_fn=filter_logits_fn,
-            filter_thres=filter_thres,
-            monotonicity_dim=monotonicity_dim,
-            streaming=True,
-            chunk_size=chunk_size,
-        ):
-            yield chunk.cpu().numpy()
+# Update instrument state and send new instruments
+def update_instruments(osc_client, instrument_name, state):
+    if instrument_name not in instrument_state:
+        print(f"Instrument '{instrument_name}' not found.")
+        return
 
-    def tokens_to_midi_events(self, tokens):
-        """Convert tokens to MIDI events.
-        
-        Args:
-            tokens: A list of tokens, where each token is a tuple or tensor representing a musical event.
-        
-        Returns:
-            A list of mido.Message objects representing the MIDI events.
-        """
-        midi_events = []
-        for token in tokens:
-            event_type, beat_index, position_within_beat, pitch, duration, instrument = token
-            
-            if event_type == 0:  # Note on
-                midi_events.append(mido.Message('note_on', note=pitch, velocity=64, time=0))
-            elif event_type == 1:  # Note off
-                midi_events.append(mido.Message('note_off', note=pitch, velocity=64, time=duration))
-            # Add more event types as needed
+    # Update the instrument state
+    instrument_state[instrument_name] = state
+    print(f"Updated instrument '{instrument_name}' to state {state}.")
 
-        return midi_events
+    # Get the list of active instruments
+    active_instruments = [
+        instrument_code_map[name]
+        for name, is_on in instrument_state.items() if is_on == 1
+    ]
 
-    def play_midi_stream(self, control_data):
-        """Generate and play MIDI data in real-time.
-        
-        Args:
-            control_data: The control data for generating the MIDI sequence.
-        """
-        with mido.open_output() as output:
-            for chunk in self.generate_midi_stream(control_data):
-                midi_events = self.tokens_to_midi_events(chunk)
-                for event in midi_events:
-                    output.send(event)
+    # Send the updated instruments to stream.py
+    osc_client.send_message("/new_instruments", active_instruments)
+    print(f"Sent /new_instruments message with instruments: {active_instruments}")
+
+# Handle MIDI messages
+def handle_midi_message(osc_client, message):
+    if message.type == 'note_on' and message.velocity > 0:
+        if message.note in midi_note_to_instrument:
+            # Toggle the corresponding instrument
+            instrument_name = midi_note_to_instrument[message.note]
+            toggle_instrument(osc_client, instrument_name)
+        elif message.note == SEND_MESSAGE_NOTE:
+            # Send the `/new_instruments` message
+            active_instruments = [
+                instrument_code_map[name]
+                for name, is_on in instrument_state.items() if is_on == 1
+            ]
+            osc_client.send_message("/new_instruments", active_instruments)
+            print(f"Sent /new_instruments message with instruments: {active_instruments}")
+        elif message.note == START_MESSAGE_NOTE:
+            # Send the `/start` message
+            osc_client.send_message("/start", [])
+            print("Sent /start message to stream.py")
+
+
+# Main function
+def main():
+    # Set up OSC client
+    osc_client = setup_osc_client(STREAM_DEVICE_IP, STREAM_DEVICE_PORT)
+
+    # List available MIDI devices
+    midi_devices = mido.get_input_names()
+    print("Available MIDI devices:")
+    for idx, device in enumerate(midi_devices):
+        print(f"{idx}: {device}")
+
+    # Ask the user to select a MIDI device by index
+    while True:
+        try:
+            midi_input_index = int(input("Enter the index of your MIDI device: "))
+            if 0 <= midi_input_index < len(midi_devices):
+                break
+            else:
+                print("Invalid index. Please try again.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
+    midi_input_name = midi_devices[midi_input_index]
+    print(f"Selected MIDI device: {midi_input_name}")
+
+    # Open MIDI input
+    with mido.open_input(midi_input_name) as midi_input:
+        print(f"Listening for MIDI messages on {midi_input_name}...")
+
+        # Listen for MIDI messages
+        for message in midi_input:
+            print(f"Received MIDI message: {message}")
+            handle_midi_message(osc_client, message)
+
+if __name__ == "__main__":
+    main()

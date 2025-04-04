@@ -63,46 +63,84 @@ def wait_for_osc_message(osc_server):
     print("Waiting for OSC message...")
     osc_server.handle_request()  # Blocks until a message is received
 
-def create_instrument_informed_tokens(instruments, sos_token):
+def create_instrument_informed_tokens(instruments, sos_token, device):
     """
-    Create initial tokens with the specified instruments.
+    Create initial tokens with the specified instruments and the correct format.
     :param instruments: List of instrument IDs.
     :param sos_token: Start-of-song token.
+    :param device: The device to move the tokens to (e.g., 'cuda' or 'cpu').
     :return: Initial tokens as a torch tensor.
     """
-    # Create a tensor for the start tokens
-    tokens = torch.zeros((1, len(instruments) + 1, 6), dtype=torch.long)
-    tokens[0, 0, 0] = sos_token  # Set the start-of-song token
+    # Calculate the total size: <start-of-song>, instruments, <start-of-notes>
+    total_size = 1 + len(instruments) + 1  # 1 for <start-of-song>, len(instruments), 1 for <start-of-notes>
 
-    # Set instrument tokens
+    # Create a tensor for the start tokens
+    tokens = torch.zeros((1, total_size, 6), dtype=torch.long, device=device)
+
+    # Add the <start-of-song> token
+    tokens[0, 0, 0] = sos_token  # Type 0 for <start-of-song>
+
+    # Add the instrument tokens
     for i, instrument in enumerate(instruments):
         tokens[0, i + 1, 0] = 1  # Type 1 for instrument
         tokens[0, i + 1, 5] = instrument  # Instrument ID
 
+    # Add the <start-of-notes> token
+    tokens[0, len(instruments) + 1, 0] = 2  # Type 2 for <start-of-notes>
+
     return tokens
 
-def extract_last_n_beats(generated_tokens, n=16):
+def extract_last_n_beats(generated_tokens, n=16, device="cpu"):
     """
     Extract the last N beats from the generated tokens.
     :param generated_tokens: List of generated token chunks.
     :param n: Number of beats to extract.
+    :param device: The device to move the tokens to (e.g., 'cuda' or 'cpu').
     :return: Last N beats as a torch tensor.
     """
-    all_tokens = torch.cat([torch.tensor(chunk) for chunk in generated_tokens], dim=1)
+    all_tokens = torch.cat([torch.tensor(chunk, device=device) for chunk in generated_tokens], dim=1)
     # Filter tokens for the last N beats
     last_n_beats = all_tokens[:, -n:, :]
+
+    # Ensure valid context for the extracted beats
+    if last_n_beats.size(1) < n:
+        # Pad with default values if there are not enough beats
+        padding = torch.zeros((1, n - last_n_beats.size(1), 6), dtype=torch.long, device=device)
+        last_n_beats = torch.cat((padding, last_n_beats), dim=1)
+
+    # Update beat values to be incremental
+    last_n_beats[0, :, 1] = torch.arange(last_n_beats.size(1), device=device)
+
     return last_n_beats
 
-def update_instruments(tokens, new_instruments):
+
+def update_instruments(tokens, new_instruments, device):
     """
     Update the instruments in the tokens.
     :param tokens: Tokens to update.
     :param new_instruments: List of new instrument IDs.
+    :param device: The device to move the tokens to (e.g., 'cuda' or 'cpu').
     :return: Updated tokens.
     """
+    # Ensure valid instrument updates
     for i, instrument in enumerate(new_instruments):
-        tokens[0, i, 5] = instrument  # Update the instrument ID in the tokens
-    return tokens
+        tokens[0, i, 0] = 1  # Type 1 for instrument
+        tokens[0, i, 5] = instrument  # Update the instrument ID
+
+    # Replace any EOS tokens (type 4) with valid tokens
+    for i in range(len(tokens[0])):
+        if tokens[0, i, 0] == 4:  # If the token type is EOS
+            tokens[0, i, 0] = 3  # Replace with a valid type (e.g., 3 for note)
+            tokens[0, i, 1] = i  # Incremental beat values
+            tokens[0, i, 2] = 0  # Reset position
+            tokens[0, i, 3] = 60  # Default pitch
+            tokens[0, i, 4] = 6  # Default duration
+            tokens[0, i, 5] = 0  # Reset instrument
+
+    # Ensure all tokens have valid beat values
+    tokens[0, :, 1] = torch.arange(tokens.size(1), device=device)  # Incremental beat values
+
+    return tokens.to(device)
 
 def wait_for_modified_n_beats(osc_server):
     """
@@ -116,6 +154,53 @@ def wait_for_modified_n_beats(osc_server):
         if message["type"] == "modified_n_beats":
             print("Received modified N-beats.")
             return message["data"]  # Return the modified N-beats
+        
+
+def modify_tokens_for_n_beat_continuation(tokens, new_instruments, device):
+    """
+    Modify tokens for N-beat continuation and ensure the correct input format.
+    Map old instrument IDs in the note tokens to the new instrument IDs.
+    :param tokens: The tokens to modify.
+    :param new_instruments: List of new instrument IDs.
+    :param device: The device to move the tokens to (e.g., 'cuda' or 'cpu').
+    :return: Modified tokens with the correct format.
+    """
+    # Extract only the tokens where the first index (type) is 3 (notes)
+    note_tokens = tokens[0][tokens[0, :, 0] == 3]
+
+    # Get the unique instrument IDs from the note tokens
+    old_instruments = note_tokens[:, 5].unique().tolist()
+
+    # Create a mapping from old instrument IDs to new instrument IDs
+    instrument_mapping = {old: new for old, new in zip(old_instruments, new_instruments)}
+
+    # Replace the instrument IDs in the note tokens using the mapping
+    for i in range(note_tokens.size(0)):
+        old_instrument = note_tokens[i, 5].item()
+        if old_instrument in instrument_mapping:
+            note_tokens[i, 5] = instrument_mapping[old_instrument]
+
+    # Calculate the total size of the new input
+    total_size = 1 + len(new_instruments) + 1 + note_tokens.size(0)  # <start-of-song>, instruments, <start-of-notes>, notes
+
+    # Create the new input pattern
+    tgt_start = torch.zeros((1, total_size, 6), dtype=torch.long, device=device)
+
+    # Add the <start-of-song> token
+    tgt_start[0, 0, 0] = 0  # Type 0 for <start-of-song>
+
+    # Add the instrument tokens
+    for i, instrument in enumerate(new_instruments):
+        tgt_start[0, i + 1, 0] = 1  # Type 1 for instrument
+        tgt_start[0, i + 1, 5] = instrument  # Instrument ID
+
+    # Add the <start-of-notes> token
+    tgt_start[0, len(new_instruments) + 1, 0] = 2  # Type 2 for <start-of-notes>
+
+    # Add the updated note tokens
+    tgt_start[0, len(new_instruments) + 2:, :] = note_tokens
+
+    return tgt_start
 
 @utils.resolve_paths
 def parse_args(args=None, namespace=None):
@@ -196,6 +281,11 @@ def parse_args(args=None, namespace=None):
         "--streaming",
         action="store_true",
         help="enable streaming mode for generating MIDI data in chunks",
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="run the script in test mode (no OSC communication)",
     )
     return parser.parse_args(args=args, namespace=namespace)
 
@@ -353,46 +443,84 @@ def main():
     beat_4 = encoding["beat_code_map"][4]
     beat_16 = encoding["beat_code_map"][16]
 
-        # Test mode
-    if args.test:
-        print("Running in test mode...")
-        generated_tokens = []
-        token_count = 0
+    # # Test mode
+    # if args.test:
+    #     print("Running in test mode...")
+    #     generated_tokens = []
+    #     token_count = 0
 
-        # Simulate a "start" message
-        instruments = [0, 1, 2]  # Example instrument IDs
-        tgt_start = create_instrument_informed_tokens(instruments, sos)
+    #     # Simulate a "start" message
+    #     instruments = [1, 48, 50]  # Example instrument IDs
+    #     tgt_start = create_instrument_informed_tokens(instruments, sos, device)
 
-        while token_count < 1100:
-            # Generate tokens in chunks
-            for chunk in model.generate(
-                tgt_start,
-                args.seq_len,
-                eos_token=eos,
-                temperature=args.temperature,
-                filter_logits_fn=args.filter,
-                filter_thres=args.filter_threshold,
-                monotonicity_dim=("type", "beat"),
-                streaming=True,
-                chunk_size=10,
-            ):
-                # Log the generated chunk
-                chunk_np = chunk.cpu().numpy()
-                print(f"Generated chunk: {chunk_np.tolist()}")
-                generated_tokens.append(chunk_np)
-                token_count += len(chunk_np)
+    #     # Print the initial input to the model
+    #     print("Initial input to the model:")
+    #     print(tgt_start)
 
-                # Simulate an instrument change
-                if token_count > 500:  # Example condition for instrument change
-                    print("Simulating instrument change...")
-                    new_instruments = [3, 4, 5]  # Example new instruments
-                    tgt_start = update_instruments(
-                        extract_last_n_beats(generated_tokens, n=16), new_instruments
-                    )
-                    break  # Exit the inner loop to handle the instrument change
+    #     while token_count < 1000:
+    #         # Generate tokens in chunks
+    #         for chunk in model.generate(
+    #             tgt_start,
+    #             args.seq_len,
+    #             eos_token=eos,
+    #             temperature=args.temperature,
+    #             filter_logits_fn=args.filter,
+    #             filter_thres=args.filter_threshold,
+    #             monotonicity_dim=("type", "beat"),
+    #             streaming=True,
+    #             chunk_size=10,
+    #         ):
+    #             # Log the generated chunk
+    #             chunk_np = chunk.cpu().numpy()
+    #             print(f"Generated chunk: {chunk_np.tolist()}")
+    #             generated_tokens.append(chunk_np)
+    #             token_count += len(chunk_np)
 
-        print("Test mode completed.")
-        return
+    #             # if token_count % 200 == 0:  # Reset every 300 tokens
+    #             #     print("Resetting input context to maintain diversity...")
+    #             #     last_tokens = extract_last_n_beats(generated_tokens, n=16, device=device)
+    #             #     tgt_start = modify_tokens_for_n_beat_continuation(last_tokens, instruments, device)
+    #             #     print(f"New input context: {tgt_start}")
+    #             #     break  # Exit the inner loop to start a new `model.generate` call
+
+
+    #             # Simulate an instrument change
+    #             if token_count > 100:  # Example condition for instrument change
+    #                 print("Simulating instrument change...")
+    #                 new_instruments = [3, 25, 38]  # Example new instruments
+
+    #                 # Extract the last generated tokens and modify them for N-beat continuation
+    #                 last_tokens = extract_last_n_beats(generated_tokens, n=16, device=device)
+    #                 tgt_start = modify_tokens_for_n_beat_continuation(last_tokens, new_instruments, device)
+
+    #                 print(f"Modified tokens for N-beat continuation: {tgt_start}")
+
+    #                 # Print the input to the model
+    #                 print("Input to the model after instrument change:")
+    #                 print(tgt_start)
+
+    #                 # Start a new model.generate(...) for N-beat continuation
+    #                 for chunk in model.generate(
+    #                     tgt_start,
+    #                     args.seq_len,
+    #                     eos_token=eos,
+    #                     temperature=args.temperature,
+    #                     filter_logits_fn=args.filter,
+    #                     filter_thres=args.filter_threshold,
+    #                     monotonicity_dim=("type", "beat"),
+    #                     streaming=True,
+    #                     chunk_size=10,
+    #                 ):
+    #                     # Log the generated chunk
+    #                     chunk_np = chunk.cpu().numpy()
+    #                     print(f"Generated chunk (N-beat continuation): {chunk_np.tolist()}")
+    #                     generated_tokens.append(chunk_np)
+    #                     token_count += len(chunk_np)
+
+    #                 break  # Exit the inner loop after handling the instrument change
+
+    #     print("Test mode completed.")
+    #     return
     
     # Initialize the OSC server
     osc_server = setup_osc_server(ip="0.0.0.0", port=5005)  # Replace with the actual IP and port
@@ -407,14 +535,93 @@ def main():
         generated_tokens = []  # Store all generated tokens
         token_count = 0  # Track the total number of generated tokens
 
+         # Test mode
+        if args.test:
+            print("Running in test mode...")
+            generated_tokens = []
+            token_count = 0
+
+            # Simulate a "start" message
+            instruments = [1, 48, 50]  # Example instrument IDs
+            tgt_start = create_instrument_informed_tokens(instruments, sos, device)
+
+            # Print the initial input to the model
+            print("Initial input to the model:")
+            print(tgt_start)
+
+            while token_count < 1000:
+                # Generate tokens in chunks
+                for chunk in model.generate(
+                    tgt_start,
+                    args.seq_len,
+                    eos_token=eos,
+                    temperature=args.temperature,
+                    filter_logits_fn=args.filter,
+                    filter_thres=args.filter_threshold,
+                    monotonicity_dim=("type", "beat"),
+                    streaming=True,
+                    chunk_size=10,
+                ):
+                    # Log the generated chunk
+                    chunk_np = chunk.cpu().numpy()
+                    print(f"Generated chunk: {chunk_np.tolist()}")
+                    generated_tokens.append(chunk_np)
+                    token_count += len(chunk_np)
+
+                    # if token_count % 200 == 0:  # Reset every 300 tokens
+                    #     print("Resetting input context to maintain diversity...")
+                    #     last_tokens = extract_last_n_beats(generated_tokens, n=16, device=device)
+                    #     tgt_start = modify_tokens_for_n_beat_continuation(last_tokens, instruments, device)
+                    #     print(f"New input context: {tgt_start}")
+                    #     break  # Exit the inner loop to start a new `model.generate` call
+
+
+                    # Simulate an instrument change
+                    if token_count > 100:  # Example condition for instrument change
+                        print("Simulating instrument change...")
+                        new_instruments = [3, 25, 38]  # Example new instruments
+
+                        # Extract the last generated tokens and modify them for N-beat continuation
+                        last_tokens = extract_last_n_beats(generated_tokens, n=16, device=device)
+                        tgt_start = modify_tokens_for_n_beat_continuation(last_tokens, new_instruments, device)
+
+                        print(f"Modified tokens for N-beat continuation: {tgt_start}")
+
+                        # Print the input to the model
+                        print("Input to the model after instrument change:")
+                        print(tgt_start)
+
+                        # Start a new model.generate(...) for N-beat continuation
+                        for chunk in model.generate(
+                            tgt_start,
+                            args.seq_len,
+                            eos_token=eos,
+                            temperature=args.temperature,
+                            filter_logits_fn=args.filter,
+                            filter_thres=args.filter_threshold,
+                            monotonicity_dim=("type", "beat"),
+                            streaming=True,
+                            chunk_size=10,
+                        ):
+                            # Log the generated chunk
+                            chunk_np = chunk.cpu().numpy()
+                            print(f"Generated chunk (N-beat continuation): {chunk_np.tolist()}")
+                            generated_tokens.append(chunk_np)
+                            token_count += len(chunk_np)
+
+                        break  # Exit the inner loop after handling the instrument change
+
+            print("Test mode completed.")
+            return
+
         while True:
             # Wait for user input via OSC
             message = wait_for_osc_message(osc_server)  # Replace with your OSC message handling function
 
             if message.type == "start":
                 # Instrument-informed generation
-                instruments = message.data
-                tgt_start = create_instrument_informed_tokens(instruments, sos)  # Create start tokens
+                instruments = message["data"]
+                tgt_start = create_instrument_informed_tokens(instruments, sos, device)  # Create start tokens
 
                 while token_count < 1100:
                     # Generate tokens in chunks
@@ -436,16 +643,25 @@ def main():
                         generated_tokens.append(chunk_np)
                         token_count += len(chunk_np)
 
-                        # Check for instrument change
+                         # Check for instrument change
                         if osc_server.has_message("new_instruments"):
+                            # Get the new instruments from the OSC message
                             new_instruments = osc_server.get_message("new_instruments")
-                            modified_n_beats = wait_for_modified_n_beats(osc_server)
-                            tgt_start = update_instruments(modified_n_beats, new_instruments)
+                            print(f"Received new instruments: {new_instruments}")
+
+                            # Extract the last generated tokens
+                            last_tokens = extract_last_n_beats(generated_tokens, n=16, device=device)
+
+                            # Modify the tokens for N-beat continuation with new instruments
+                            tgt_start = modify_tokens_for_n_beat_continuation(last_tokens, new_instruments, device)
+
+                            print(f"Updated tgt_start with new instruments: {tgt_start}")
+
                             break  # Exit the inner loop to handle the instrument change
-            
+
             if token_count >= 1100:
                 # Switch to N-beat continuation
-                last_16_beats = extract_last_n_beats(generated_tokens, n=16)
+                last_16_beats = extract_last_n_beats(generated_tokens, n=16, device=device)
                 tgt_start = last_16_beats
 
                 while token_count < 1200:
@@ -467,11 +683,21 @@ def main():
                         generated_tokens.append(chunk_np)
                         token_count += len(chunk_np)
 
+                        
                         # Check for instrument change
                         if osc_server.has_message("new_instruments"):
+                            # Get the new instruments from the OSC message
                             new_instruments = osc_server.get_message("new_instruments")
-                            modified_n_beats = wait_for_modified_n_beats(osc_server)
-                            tgt_start = update_instruments(modified_n_beats, new_instruments)
+                            print(f"Received new instruments: {new_instruments}")
+
+                            # Extract the last generated tokens
+                            last_tokens = extract_last_n_beats(generated_tokens, n=16, device=device)
+
+                            # Modify the tokens for N-beat continuation with new instruments
+                            tgt_start = modify_tokens_for_n_beat_continuation(last_tokens, new_instruments, device)
+
+                            print(f"Updated tgt_start with new instruments: {tgt_start}")
+
                             break  # Exit the inner loop to handle the instrument change
 
 
