@@ -286,33 +286,20 @@ def main():
 
     # Create the model
     logging.info(f"Creating the model...")
-    # model = music_x_transformers.MusicXTransformer(
-    #     dim=train_args["dim"],
-    #     encoding=encoding,
-    #     depth=train_args["layers"],
-    #     heads=train_args["heads"],
-    #     max_seq_len=train_args["max_seq_len"],
-    #     max_beat=train_args["max_beat"],
-    #     rotary_pos_emb=train_args["rel_pos_emb"],
-    #     use_abs_pos_emb=train_args["abs_pos_emb"],
-    #     emb_dropout=train_args["dropout"],
-    #     attn_dropout=train_args["dropout"],
-    #     ff_dropout=train_args["dropout"],
-    # ).to(device)
-
     model = music_x_transformers.MusicXTransformer(
-        dim=512,  # Match the checkpoint's embedding size
+        dim=train_args["dim"],
         encoding=encoding,
-        depth=6,  # Match the checkpoint's depth
-        heads=8,  # Match the checkpoint's number of attention heads
-        max_seq_len=1024,
-        max_beat=256,
-        rotary_pos_emb=False,
-        use_abs_pos_emb=True,
-        emb_dropout=0.1,
-        attn_dropout=0.1,
-        ff_dropout=0.1,
-    )
+        depth=train_args["layers"],
+        heads=train_args["heads"],
+        max_seq_len=train_args["max_seq_len"],
+        max_beat=train_args["max_beat"],
+        rotary_pos_emb=train_args["rel_pos_emb"],
+        use_abs_pos_emb=train_args["abs_pos_emb"],
+        emb_dropout=train_args["dropout"],
+        attn_dropout=train_args["dropout"],
+        ff_dropout=train_args["dropout"],
+    ).to(device)
+
     print("Model created successfully.")  # Debug print
 
     # Load the checkpoint
