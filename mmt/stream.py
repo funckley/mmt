@@ -16,6 +16,7 @@ import music_x_transformers
 import representation
 import utils
 import time
+import socket
 
 from pythonosc.udp_client import SimpleUDPClient
 from pythonosc.dispatcher import Dispatcher
@@ -24,26 +25,33 @@ from pythonosc.osc_server import BlockingOSCUDPServer
 debug = True  # Set to True for debugging mode
 
 
-def setup_osc_server(ip="0.0.0.0", port=5005):
+def setup_osc_server(ip="0.0.0.0", port=5005, message_container=None):
     """
     Set up the OSC server to receive messages.
     :param ip: IP address to bind the server.
     :param port: Port to bind the server.
+    :param message_container: A shared dictionary to store incoming messages.
     :return: Configured OSC server.
     """
     dispatcher = Dispatcher()
 
     # Map OSC addresses to handlers
-    dispatcher.map("/start", lambda addr, *args: {"type": "start", "data": args})
-    dispatcher.map("/new_instruments", lambda addr, *args: {"type": "new_instruments", "data": args})
-    dispatcher.map("/modified_n_beats", lambda addr, *args: {"type": "modified_n_beats", "data": args})
+    def start_handler(address, *args):
+        print(f"Received /start message with args: {args}")  # Debug print
+        message_container["start"] = {"type": "start", "data": args}
+
+    def new_instruments_handler(address, *args):
+        message_container["new_instruments"] = {"type": "new_instruments", "data": args}
+
+    dispatcher.map("/start", start_handler)
+    dispatcher.map("/new_instruments", new_instruments_handler)
 
     server = BlockingOSCUDPServer((ip, port), dispatcher)
     print(f"OSC server listening on {ip}:{port}")
     return server
 
 
-def setup_osc_client(ip="127.0.0.1", port=5006):
+def setup_osc_client(ip="35.3.44.33", port=5006):
     """
     Set up the OSC client to send messages.
     :param ip: IP address of the receiver.
@@ -54,14 +62,61 @@ def setup_osc_client(ip="127.0.0.1", port=5006):
     print(f"OSC client set up to send messages to {ip}:{port}")
     return client
 
-def wait_for_osc_message(osc_server):
+# def wait_for_osc_message(osc_server, timeout=0.1):
+#     """
+#     Wait for and process incoming OSC messages.
+#     :param osc_server: The OSC server instance.
+#     :return: Parsed OSC message.
+#     """
+#     print("Waiting for OSC message...")
+#     message_container = {}
+
+#     def message_handler(address, *args):
+#         message_container["type"] = address.strip("/")
+#         message_container["data"] = args
+
+#     # Temporarily map all OSC messages to the handler
+#     osc_server.dispatcher.map("*", message_handler)
+
+#     # Handle a single request
+#     osc_server.handle_request()
+
+#     # Unmap the handler after processing
+#     osc_server.dispatcher.unmap("*", message_handler)
+
+#     # Return the parsed message
+#     return message_container if "type" in message_container else None
+
+def wait_for_osc_message(osc_server, timeout=0.1):
     """
-    Wait for and process incoming OSC messages.
+    Wait for and process incoming OSC messages with a timeout.
     :param osc_server: The OSC server instance.
-    :return: Parsed OSC message.
+    :param timeout: Timeout in seconds for waiting for a message.
+    :return: Parsed OSC message or None if no message is received.
     """
-    print("Waiting for OSC message...")
-    osc_server.handle_request()  # Blocks until a message is received
+    message_container = {}
+
+    def message_handler(address, *args):
+        message_container["type"] = address.strip("/")
+        message_container["data"] = args
+
+    # Temporarily map all OSC messages to the handler
+    osc_server.dispatcher.map("*", message_handler)
+
+    # Handle a single request with a timeout
+    osc_server.socket.settimeout(timeout)
+    try:
+        osc_server.handle_request()
+    except socket.timeout:
+        pass  # No message received within the timeout
+    except Exception as e:
+        print(f"Error while handling OSC message: {e}")
+
+    # Unmap the handler after processing
+    osc_server.dispatcher.unmap("*", message_handler)
+
+    # Return the parsed message
+    return message_container if "type" in message_container else None
 
 def create_instrument_informed_tokens(instruments, sos_token, device):
     """
@@ -521,12 +576,15 @@ def main():
 
     #     print("Test mode completed.")
     #     return
+
+    # Initialize the shared message container
+    message_container = {}
     
     # Initialize the OSC server
-    osc_server = setup_osc_server(ip="0.0.0.0", port=5005)  # Replace with the actual IP and port
+    osc_server = setup_osc_server(ip="0.0.0.0", port=5005, message_container=message_container)
 
     # Initialize the OSC client
-    osc_client = setup_osc_client(ip="127.0.0.1", port=5006)  # Replace with the actual IP and port
+    osc_client = setup_osc_client(ip="35.3.44.33", port=5006)  # Replace with the actual IP and port
 
     # Iterate over the dataset
     with torch.no_grad():
@@ -614,16 +672,25 @@ def main():
             print("Test mode completed.")
             return
 
+
         while True:
             # Wait for user input via OSC
-            message = wait_for_osc_message(osc_server)  # Replace with your OSC message handling function
+            message = wait_for_osc_message(osc_server)
 
-            if message.type == "start":
+            if message and message["type"] == "start":
                 # Instrument-informed generation
-                instruments = message["data"]
-                tgt_start = create_instrument_informed_tokens(instruments, sos, device)  # Create start tokens
 
-                while token_count < 1100:
+            # if "start" in message_container:
+                # message = message_container.pop("start")  # Remove the message after processing
+
+                instruments = message["data"]
+                print(f"Received start message with instruments: {instruments}")
+
+                tgt_start = create_instrument_informed_tokens(instruments, sos, device)  # Create start tokens
+                print(f"Initial input tokens created: {tgt_start}")
+                
+                # Begin generation
+                while token_count < 1000:
                     # Generate tokens in chunks
                     for chunk in model.generate(
                         tgt_start,
@@ -642,11 +709,17 @@ def main():
                         osc_client.send_message("/tokens", chunk_np.tolist())
                         generated_tokens.append(chunk_np)
                         token_count += len(chunk_np)
+                        print(f"Generated chunk: {chunk_np.tolist()}")
 
-                         # Check for instrument change
-                        if osc_server.has_message("new_instruments"):
+                        
+                        # Check for new messages
+                        message = wait_for_osc_message(osc_server, timeout=0.01)
+                        # Check for instrument change
+                        # if "new_instruments" in message_container:
+                        if message and message["type"] == "new_instruments":
                             # Get the new instruments from the OSC message
-                            new_instruments = osc_server.get_message("new_instruments")
+                            # new_instruments = message_container.pop("new_instruments")["data"]
+                            new_instruments = message["data"]
                             print(f"Received new instruments: {new_instruments}")
 
                             # Extract the last generated tokens
@@ -658,6 +731,7 @@ def main():
                             print(f"Updated tgt_start with new instruments: {tgt_start}")
 
                             break  # Exit the inner loop to handle the instrument change
+
 
             if token_count >= 1100:
                 # Switch to N-beat continuation
